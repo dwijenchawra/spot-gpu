@@ -1,21 +1,24 @@
 # llama-swap configuration for Gilbreth (4x H100 80GB)
+# Using vLLM for serving
 
 healthCheckTimeout: 600
 
 models:
   qwen3-80b:
-    cmd: /scratch/gilbreth/dchawra/llama.cpp/build/bin/llama-server --port ${PORT} --host 127.0.0.1 -m /scratch/gilbreth/dchawra/models/Qwen3-Next-80B-A3B/Qwen3-Next-80B-A3B-Instruct-Q4_K_M.gguf -ngl 99 -c 65536 -fa on
+    cmd: source /home/dchawra/llm-watchdog/.venv/bin/activate && HF_HOME=/scratch/gilbreth/dchawra/cache/huggingface /home/dchawra/llm-watchdog/.venv/bin/vllm serve zai-org/Qwen3-Next-80B-A3B --tensor-parallel-size 4 --port ${PORT} --host 127.0.0.1
     aliases:
-      - Qwen3-Next-80B-A3B-Instruct-Q4_K_M.gguf
+      - Qwen3-Next-80B-A3B
       - qwen3
+      - qwen3-80b
       - qwen
       - default
     ttl: 0
 
   glm-4.7:
-    cmd: /scratch/gilbreth/dchawra/llama.cpp/build/bin/llama-server --port ${PORT} --host 127.0.0.1 -m /scratch/gilbreth/dchawra/models/GLM-4.7/UD-Q2_K_XL/GLM-4.7-UD-Q2_K_XL-00001-of-00003.gguf -ngl 99 -c 32768 -fa on
+    # GLM-4.7-Flash with mtp speculative decoding
+    cmd: source /home/dchawra/llm-watchdog/.venv/bin/activate && HF_HOME=/scratch/gilbreth/dchawra/cache/huggingface /home/dchawra/llm-watchdog/.venv/bin/vllm serve zai-org/GLM-4.7-Flash --tensor-parallel-size 4 --speculative-config.method mtp --speculative-config.num_speculative_tokens 1 --tool-call-parser glm47 --reasoning-parser glm45 --enable-auto-tool-choice --served-model-name glm-4.7-flash --port ${PORT} --host 127.0.0.1
     aliases:
-      - GLM-4.7-UD-Q2_K_XL-00001-of-00003.gguf
+      - GLM-4.7-Flash
       - glm
       - glm4
     ttl: 0

@@ -23,8 +23,11 @@ else
     exit 1
 fi
 
+# Activate venv
+source "${LLM_VENV}/bin/activate"
+
 # Validate required config
-for var in NTFY_TOPIC LLAMA_SERVER_BIN MODEL_PATH CLOUDFLARED_BIN TUNNEL_ID; do
+for var in NTFY_TOPIC LLM_VENV LLM_BIN MODEL_NAME SERVER_PORT CLOUDFLARED_BIN TUNNEL_ID; do
     if [[ -z "${!var:-}" ]]; then
         echo "ERROR: $var not set in config"
         exit 1
@@ -158,12 +161,10 @@ stop_tunnel() {
 start_server() {
     log "Starting LLM server..."
 
-    "$LLAMA_SERVER_BIN" \
-        -m "$MODEL_PATH" \
-        --host 0.0.0.0 \
-        --port "$SERVER_PORT" \
-        -ngl 999 \
-        ${LLAMA_EXTRA_ARGS:-} &
+    export HF_HOME="/scratch/gilbreth/dchawra/cache/huggingface"
+
+    "$LLM_BIN" serve "$MODEL_NAME" \
+        ${VLLM_ARGS:-} &
     SERVER_PID=$!
 
     log "Waiting for server to initialize..."
@@ -195,13 +196,21 @@ start_server() {
 stop_server() {
     if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
         log "Stopping server (PID: $SERVER_PID)..."
+
+        # Graceful shutdown
         kill -TERM "$SERVER_PID" 2>/dev/null
         sleep 3
-        kill -KILL "$SERVER_PID" 2>/dev/null
-        wait "$SERVER_PID" 2>/dev/null
+
+        # Force kill if still running
+        if kill -0 "$SERVER_PID" 2>/dev/null; then
+            kill -KILL "$SERVER_PID" 2>/dev/null
+            wait "$SERVER_PID" 2>/dev/null
+        fi
     fi
     SERVER_PID=""
-    pkill -f "llama-server.*--port ${SERVER_PORT}" 2>/dev/null || true
+    # Clean up venv processes
+    pkill -f "vllm serve" 2>/dev/null || true
+    deactivate
 }
 
 # =============================================================================
@@ -224,7 +233,7 @@ start_all() {
     fi
 
     local gpu_count=$(nvidia-smi -L 2>/dev/null | wc -l || echo "?")
-    notify "LLM Server Online" \
+    notify "vLLM Server Online" \
         "$HOSTNAME_SHORT: ${gpu_count} GPUs
 https://${TUNNEL_HOSTNAME}" \
         3
@@ -342,7 +351,7 @@ trap cleanup SIGTERM SIGINT SIGHUP
 log "=========================================="
 log "LLM Watchdog on $HOSTNAME_SHORT"
 log "  Cgroup: $CGROUP_BASE"
-log "  Model:  $(basename "$MODEL_PATH")"
+log "  Model:  ${MODEL_NAME}"
 log "  URL:    https://$TUNNEL_HOSTNAME"
 if [[ "$USE_INOTIFY" == "true" ]]; then
     log "  Detection: inotify (instant)"
@@ -370,7 +379,7 @@ while true; do
             log "Job detected: $(list_jobs | tr '\n' ' ')"
             stop_all
             DOWNTIME_START=$(date +%s)
-            notify "LLM Server Yielding" "$HOSTNAME_SHORT: Slurm job detected" 4
+            notify "vLLM Server Yielding" "$HOSTNAME_SHORT: Slurm job detected" 4
         else
             stop_all
             sleep 5

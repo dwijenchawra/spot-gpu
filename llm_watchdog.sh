@@ -206,6 +206,10 @@ stop_server() {
             kill -KILL "$SERVER_PID" 2>/dev/null
             wait "$SERVER_PID" 2>/dev/null
         fi
+        sleep 3
+        if [[ $(list_jobs) -gt 0 ]]; then
+            pkill -u "$USER"
+        fi
     fi
     SERVER_PID=""
     # Clean up venv processes

@@ -1,0 +1,21 @@
+# llama-swap configuration for Gilbreth (4x H100 80GB)
+
+healthCheckTimeout: 600
+
+models:
+  qwen3-80b:
+    cmd: /scratch/gilbreth/dchawra/llama.cpp/build/bin/llama-server --port ${PORT} --host 127.0.0.1 -m /scratch/gilbreth/dchawra/models/Qwen3-Next-80B-A3B/Qwen3-Next-80B-A3B-Instruct-Q4_K_M.gguf -ngl 99 -c 65536 -fa on
+    aliases:
+      - Qwen3-Next-80B-A3B-Instruct-Q4_K_M.gguf
+      - qwen3
+      - qwen
+      - default
+    ttl: 0
+
+  glm-4.7:
+    cmd: /scratch/gilbreth/dchawra/llama.cpp/build/bin/llama-server --port ${PORT} --host 127.0.0.1 -m /scratch/gilbreth/dchawra/models/GLM-4.7/UD-Q2_K_XL/GLM-4.7-UD-Q2_K_XL-00001-of-00003.gguf -ngl 99 -c 32768 -fa on
+    aliases:
+      - GLM-4.7-UD-Q2_K_XL-00001-of-00003.gguf
+      - glm
+      - glm4
+    ttl: 0

@@ -40,10 +40,7 @@ fi
 source "$MODEL_FILE"
 
 # Environment resolution (same logic as watchdog)
-if [[ -n "${VENV_PROFILE:-}" ]]; then
-    LLM_VENV="${SCRIPT_DIR}/${VENV_PROFILE}"
-fi
-if [[ "${REQUIRES_CUDA13:-false}" == "true" ]]; then
+if [[ "${CUDA_SETUP:-false}" == "true" ]]; then
     export LD_LIBRARY_PATH="${CUDA12_LIB}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     export CUDA_HOME="${CUDA_HOME_OVERRIDE}"
 fi

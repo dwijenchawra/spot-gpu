@@ -33,26 +33,15 @@ else
 fi
 
 # =============================================================================
-# Environment Resolution
+# Environment Resolution (per-node CUDA setup from config.env)
 # =============================================================================
-# Model profiles can override the venv and request CUDA 13 setup.
 
-# Resolve venv: model's VENV_PROFILE overrides config's LLM_VENV
-if [[ -n "${VENV_PROFILE:-}" ]]; then
-    LLM_VENV="${SCRIPT_DIR}/${VENV_PROFILE}"
-    LLM_BIN="${LLM_VENV}/bin/vllm"
-fi
-
-# CUDA 13 environment (only when model requires it)
-if [[ "${REQUIRES_CUDA13:-false}" == "true" ]]; then
+if [[ "${CUDA_SETUP:-false}" == "true" ]]; then
     export LD_LIBRARY_PATH="${CUDA12_LIB}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     export CUDA_HOME="${CUDA_HOME_OVERRIDE}"
 fi
 
-# HF cache (always set, single location)
 export HF_HOME="${HF_HOME}"
-
-# Activate the resolved venv
 source "${LLM_VENV}/bin/activate"
 
 # Validate required config
@@ -382,7 +371,7 @@ log "=========================================="
 log "LLM Watchdog on $HOSTNAME_SHORT"
 log "  Model:  ${MODEL_NAME}"
 log "  Venv:   ${LLM_VENV}"
-if [[ "${REQUIRES_CUDA13:-false}" == "true" ]]; then
+if [[ "${CUDA_SETUP:-false}" == "true" ]]; then
     log "  CUDA:   CUDA_HOME=${CUDA_HOME}, LD_LIBRARY_PATH prepended"
 fi
 log "  Cgroup: $CGROUP_BASE"

@@ -5,7 +5,7 @@
 # Usage:
 #   ./switch-model.sh                  # list available models
 #   ./switch-model.sh glm-4.7-flash   # switch to GLM
-#   ./switch-model.sh minimax-m2.5    # switch to MiniMax (CUDA 13)
+#   ./switch-model.sh minimax-m2.5    # switch to MiniMax
 #
 
 set -euo pipefail
@@ -20,15 +20,10 @@ if [[ $# -eq 0 ]]; then
     echo "Available models:"
     for f in "$MODELS_DIR"/*.env; do
         name=$(basename "$f" .env)
-        # Show environment tag
-        env_tag=""
-        if grep -q 'REQUIRES_CUDA13="true"' "$f" 2>/dev/null; then
-            env_tag=" [cuda13]"
-        fi
         if [[ "$name" == "$current" ]]; then
-            echo "  * $name${env_tag}  (active)"
+            echo "  * $name  (active)"
         else
-            echo "    $name${env_tag}"
+            echo "    $name"
         fi
     done
     echo ""
@@ -50,6 +45,6 @@ ln -sf "models/${MODEL}.env" "$LINK"
 echo "Switched to: $MODEL"
 echo ""
 # Show a preview of the model config
-grep -E "^(MODEL_NAME|VLLM_ARGS|VENV_PROFILE|REQUIRES_CUDA13|export )" "$PROFILE" | head -5
+grep -E "^(MODEL_NAME|VLLM_ARGS|export )" "$PROFILE" | head -5
 echo ""
 echo "Restart the watchdog to apply."

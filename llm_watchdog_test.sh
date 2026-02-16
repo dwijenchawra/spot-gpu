@@ -28,13 +28,9 @@ else
 fi
 
 # =============================================================================
-# Environment Resolution
+# Environment Resolution (per-node CUDA setup from config.env)
 # =============================================================================
-if [[ -n "${VENV_PROFILE:-}" ]]; then
-    LLM_VENV="${SCRIPT_DIR}/${VENV_PROFILE}"
-    LLM_BIN="${LLM_VENV}/bin/vllm"
-fi
-if [[ "${REQUIRES_CUDA13:-false}" == "true" ]]; then
+if [[ "${CUDA_SETUP:-false}" == "true" ]]; then
     export LD_LIBRARY_PATH="${CUDA12_LIB}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     export CUDA_HOME="${CUDA_HOME_OVERRIDE}"
 fi
@@ -245,7 +241,7 @@ log "LLM Watchdog TEST MODE on $HOSTNAME_SHORT"
 log "=========================================="
 log "  Model:  ${MODEL_NAME}"
 log "  Venv:   ${LLM_VENV}"
-if [[ "${REQUIRES_CUDA13:-false}" == "true" ]]; then
+if [[ "${CUDA_SETUP:-false}" == "true" ]]; then
     log "  CUDA:   CUDA_HOME=${CUDA_HOME}, LD_LIBRARY_PATH prepended"
 fi
 log "  URL:    https://$TUNNEL_HOSTNAME"

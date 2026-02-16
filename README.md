@@ -7,7 +7,7 @@ A daemon for running vLLM servers on idle GPUs at Purdue University's Gilbreth c
 - **Idle GPU utilization** -- starts vLLM when GPUs are idle, yields instantly when Slurm jobs appear
 - **Zero RPC detection** -- monitors cgroup filesystem directly, no Slurm controller calls
 - **Multi-model profiles** -- swap models with one command (`./switch-model.sh`)
-- **CUDA 13 support** -- models can declare `REQUIRES_CUDA13=true` to use a separate venv + CUDA environment
+- **Per-node CUDA config** -- nodes needing CUDA overrides set `CUDA_SETUP=true` in config.env
 - **Public access** -- Cloudflare tunnel at `https://purduechat.dwijen.dev`
 - **Notifications** -- ntfy.sh alerts for state changes
 
@@ -20,8 +20,8 @@ cd ~/llm-watchdog
 # List available models
 ./switch-model.sh
 #   * glm-4.7-flash  (active)
-#     minimax-m2.5 [cuda13]
-#     qwen3-coder-fp8 [cuda13]
+#     minimax-m2.5
+#     qwen3-coder-fp8
 
 # Switch models
 ./switch-model.sh minimax-m2.5
@@ -42,13 +42,11 @@ llm-watchdog/
 ├── config.env               # infrastructure config (shared across models)
 ├── active-model.env -> models/<current>.env
 ├── models/
-│   ├── glm-4.7-flash.env       # standard venv
-│   ├── minimax-m2.5.env         # CUDA 13 venv
-│   └── qwen3-coder-fp8.env     # CUDA 13 venv
+│   ├── glm-4.7-flash.env       # works on any node
+│   ├── minimax-m2.5.env         # needs CUDA >= 12.8
+│   └── qwen3-coder-fp8.env     # needs CUDA >= 12.8
 ├── bench-results/           # benchmark output
-├── .venv/                   # standard venv
-└── cu13/
-    └── .venv/               # CUDA 13 venv
+└── .venv/                   # vLLM virtual environment
 ```
 
 ## Model Profiles
@@ -59,11 +57,9 @@ Each model is a file in `models/` with these variables:
 |----------|----------|-------------|
 | `MODEL_NAME` | yes | HuggingFace model ID or local path |
 | `VLLM_ARGS` | yes | Arguments passed to `vllm serve` |
-| `VENV_PROFILE` | no | Override venv path (relative to project root) |
-| `REQUIRES_CUDA13` | no | Set to `"true"` to enable CUDA 13 env setup |
 | `export ...` | no | Per-model environment variables |
 
-Models without `VENV_PROFILE` use the default `.venv`. Models with `REQUIRES_CUDA13="true"` get `LD_LIBRARY_PATH` and `CUDA_HOME` configured from `config.env`.
+Model profiles are node-agnostic. CUDA environment overrides are configured per-node in `config.env`. FP8 models will fail on nodes without sufficient CUDA.
 
 ### Adding a New Model
 
@@ -88,9 +84,10 @@ Infrastructure settings shared across all models:
 # Notifications
 NTFY_TOPIC="purduechat-watchdog"
 
-# CUDA 13 (only used when model sets REQUIRES_CUDA13=true)
-CUDA12_LIB="/apps/spack/gilbreth-r9/apps/cuda/12.6.0-gcc-11.5.0-a7cv7sp/lib64"
-CUDA_HOME_OVERRIDE="/apps/external/cuda-toolkit/13.1.0"
+# CUDA overrides (uncomment on nodes needing CUDA 13 for FP8)
+#CUDA_SETUP="true"
+#CUDA12_LIB="/apps/spack/gilbreth-r9/apps/cuda/12.6.0-gcc-11.5.0-a7cv7sp/lib64"
+#CUDA_HOME_OVERRIDE="/apps/external/cuda-toolkit/13.1.0"
 
 # vLLM defaults
 LLM_VENV="/home/dchawra/llm-watchdog/.venv"

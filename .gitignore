@@ -1,3 +1,9 @@
+# Project-specific
+cufile.log
+bench-results/
+active-model.env
+.opencode/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

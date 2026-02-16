@@ -3,7 +3,7 @@
 # llm_watchdog.sh - Run LLM server on idle Gilbreth nodes, yield to Slurm jobs
 #
 # Detection: cgroup filesystem (zero RPC calls to Slurm controller)
-# Manages: llama-server + cloudflared tunnel
+# Manages: vLLM + cloudflared tunnel
 # Notifies: ntfy.sh
 #
 
@@ -15,6 +15,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${1:-$SCRIPT_DIR/config.env}"
+MODEL_FILE="${2:-$SCRIPT_DIR/active-model.env}"
 
 if [[ -f "$CONFIG_FILE" ]]; then
     source "$CONFIG_FILE"
@@ -23,7 +24,35 @@ else
     exit 1
 fi
 
-# Activate venv
+# Source active model profile (see models/*.env)
+if [[ -f "$MODEL_FILE" ]]; then
+    source "$MODEL_FILE"
+else
+    echo "ERROR: No active model. Run: ./switch-model.sh <model-name>"
+    exit 1
+fi
+
+# =============================================================================
+# Environment Resolution
+# =============================================================================
+# Model profiles can override the venv and request CUDA 13 setup.
+
+# Resolve venv: model's VENV_PROFILE overrides config's LLM_VENV
+if [[ -n "${VENV_PROFILE:-}" ]]; then
+    LLM_VENV="${SCRIPT_DIR}/${VENV_PROFILE}"
+    LLM_BIN="${LLM_VENV}/bin/vllm"
+fi
+
+# CUDA 13 environment (only when model requires it)
+if [[ "${REQUIRES_CUDA13:-false}" == "true" ]]; then
+    export LD_LIBRARY_PATH="${CUDA12_LIB}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export CUDA_HOME="${CUDA_HOME_OVERRIDE}"
+fi
+
+# HF cache (always set, single location)
+export HF_HOME="${HF_HOME}"
+
+# Activate the resolved venv
 source "${LLM_VENV}/bin/activate"
 
 # Validate required config
@@ -161,8 +190,6 @@ stop_tunnel() {
 start_server() {
     log "Starting LLM server..."
 
-    export HF_HOME="/scratch/gilbreth/dchawra/cache/huggingface"
-
     "$LLM_BIN" serve "$MODEL_NAME" \
         ${VLLM_ARGS:-} &
     SERVER_PID=$!
@@ -212,9 +239,8 @@ stop_server() {
         fi
     fi
     SERVER_PID=""
-    # Clean up venv processes
+    # Clean up vllm processes
     pkill -f "vllm serve" 2>/dev/null || true
-    deactivate
 }
 
 # =============================================================================
@@ -354,8 +380,12 @@ trap cleanup SIGTERM SIGINT SIGHUP
 
 log "=========================================="
 log "LLM Watchdog on $HOSTNAME_SHORT"
-log "  Cgroup: $CGROUP_BASE"
 log "  Model:  ${MODEL_NAME}"
+log "  Venv:   ${LLM_VENV}"
+if [[ "${REQUIRES_CUDA13:-false}" == "true" ]]; then
+    log "  CUDA:   CUDA_HOME=${CUDA_HOME}, LD_LIBRARY_PATH prepended"
+fi
+log "  Cgroup: $CGROUP_BASE"
 log "  URL:    https://$TUNNEL_HOSTNAME"
 if [[ "$USE_INOTIFY" == "true" ]]; then
     log "  Detection: inotify (instant)"

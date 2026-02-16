@@ -10,6 +10,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${1:-$SCRIPT_DIR/config.env}"
+MODEL_FILE="${2:-$SCRIPT_DIR/active-model.env}"
 
 if [[ -f "$CONFIG_FILE" ]]; then
     source "$CONFIG_FILE"
@@ -17,6 +18,28 @@ else
     echo "ERROR: Config file not found: $CONFIG_FILE"
     exit 1
 fi
+
+# Source active model profile (see models/*.env)
+if [[ -f "$MODEL_FILE" ]]; then
+    source "$MODEL_FILE"
+else
+    echo "ERROR: No active model. Run: ./switch-model.sh <model-name>"
+    exit 1
+fi
+
+# =============================================================================
+# Environment Resolution
+# =============================================================================
+if [[ -n "${VENV_PROFILE:-}" ]]; then
+    LLM_VENV="${SCRIPT_DIR}/${VENV_PROFILE}"
+    LLM_BIN="${LLM_VENV}/bin/vllm"
+fi
+if [[ "${REQUIRES_CUDA13:-false}" == "true" ]]; then
+    export LD_LIBRARY_PATH="${CUDA12_LIB}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export CUDA_HOME="${CUDA_HOME_OVERRIDE}"
+fi
+export HF_HOME="${HF_HOME}"
+source "${LLM_VENV}/bin/activate"
 
 HOSTNAME_SHORT=$(hostname -s)
 
@@ -99,23 +122,20 @@ stop_tunnel() {
 
 start_server() {
     log "Starting LLM server..."
-    "$LLAMA_SERVER_BIN" \
-        -m "$MODEL_PATH" \
-        --host 0.0.0.0 \
-        --port "$SERVER_PORT" \
-        -ngl 99 \
-        ${LLAMA_EXTRA_ARGS:-} &
+
+    "$LLM_BIN" serve "$MODEL_NAME" \
+        ${VLLM_ARGS:-} &
     SERVER_PID=$!
 
-    log "Waiting for server to initialize (this may take a few minutes)..."
+    log "Waiting for server to initialize..."
     local retries=0
     while [[ $retries -lt 120 ]]; do
         if curl -sf "http://localhost:${SERVER_PORT}/health" >/dev/null 2>&1; then
-            log "Server is healthy!"
+            log "Server is healthy"
             break
         fi
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-            log "ERROR: Server died"
+            log "ERROR: Server died during startup"
             SERVER_PID=""
             return 1
         fi
@@ -141,7 +161,7 @@ stop_server() {
         wait "$SERVER_PID" 2>/dev/null
     fi
     SERVER_PID=""
-    pkill -f "llama-server.*--port ${SERVER_PORT}" 2>/dev/null || true
+    pkill -f "vllm serve" 2>/dev/null || true
 }
 
 start_all() {
@@ -153,7 +173,7 @@ start_all() {
     start_tunnel || { stop_server; return 1; }
 
     local gpu_count=$(nvidia-smi -L 2>/dev/null | wc -l || echo "?")
-    notify "LLM Server Online (TEST)" "$HOSTNAME_SHORT: ${gpu_count} GPUs - https://${TUNNEL_HOSTNAME}" 3
+    notify "vLLM Server Online (TEST)" "$HOSTNAME_SHORT: ${gpu_count} GPUs - https://${TUNNEL_HOSTNAME}" 3
     return 0
 }
 
@@ -211,7 +231,7 @@ wait_for_no_jobs() {
 cleanup() {
     log "Shutting down..."
     stop_all
-    notify "LLM Watchdog Stopped (TEST)" "$HOSTNAME_SHORT" 3
+    notify "vLLM Watchdog Stopped (TEST)" "$HOSTNAME_SHORT" 3
     exit 0
 }
 
@@ -223,7 +243,11 @@ rm -f "$FAKE_JOB_FILE"
 log "=========================================="
 log "LLM Watchdog TEST MODE on $HOSTNAME_SHORT"
 log "=========================================="
-log "  Model:  $(basename "$MODEL_PATH")"
+log "  Model:  ${MODEL_NAME}"
+log "  Venv:   ${LLM_VENV}"
+if [[ "${REQUIRES_CUDA13:-false}" == "true" ]]; then
+    log "  CUDA:   CUDA_HOME=${CUDA_HOME}, LD_LIBRARY_PATH prepended"
+fi
 log "  URL:    https://$TUNNEL_HOSTNAME"
 log "  Detection: ${USE_INOTIFY:+inotify}${USE_INOTIFY:-polling}"
 log ""
@@ -249,7 +273,7 @@ while true; do
             log "!!! FAKE JOB DETECTED - SHUTTING DOWN !!!"
             stop_all
             DOWNTIME_START=$(date +%s)
-            notify "LLM Server Yielding (TEST)" "$HOSTNAME_SHORT: Fake job detected" 4
+            notify "vLLM Server Yielding (TEST)" "$HOSTNAME_SHORT: Fake job detected" 4
         else
             stop_all
             sleep 5

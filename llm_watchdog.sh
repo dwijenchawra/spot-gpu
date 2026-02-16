@@ -1,8 +1,9 @@
 #!/bin/bash
 #
-# llm_watchdog.sh - Run LLM server on idle Gilbreth nodes, yield to Slurm jobs
+# llm_watchdog.sh - Run LLM server on idle GPUs, yield to Slurm jobs
 #
-# Detection: cgroup filesystem (zero RPC calls to Slurm controller)
+# GPU detection: cgroup filesystem (fast job arrival signal)
+#              + scontrol (authoritative GPU assignment per job)
 # Manages: vLLM + cloudflared tunnel
 # Notifies: ntfy.sh
 #
@@ -45,7 +46,7 @@ export HF_HOME="${HF_HOME}"
 source "${LLM_VENV}/bin/activate"
 
 # Validate required config
-for var in NTFY_TOPIC LLM_VENV LLM_BIN MODEL_NAME SERVER_PORT CLOUDFLARED_BIN TUNNEL_ID; do
+for var in NTFY_TOPIC LLM_VENV LLM_BIN MODEL_NAME SERVER_PORT CLOUDFLARED_BIN TUNNEL_ID NUM_GPUS; do
     if [[ -z "${!var:-}" ]]; then
         echo "ERROR: $var not set in config"
         exit 1
@@ -72,7 +73,8 @@ fi
 
 SERVER_PID=""
 TUNNEL_PID=""
-INOTIFY_PID=""
+ACTIVE_GPUS=""      # comma-separated GPU indices we're running on
+TOTAL_GPUS=0        # total GPUs on node (set at startup)
 DOWNTIME_START=0
 
 # =============================================================================
@@ -84,34 +86,102 @@ log() {
 }
 
 # =============================================================================
-# Cgroup-based Job Detection (NO RPC to Slurm controller)
+# GPU Detection (nvidia-smi + scontrol + cgroup)
 # =============================================================================
-#
-# NOTE: Job directories can persist after jobs end (stale cgroups).
-# We must check for ACTIVE PROCESSES, not just directory existence.
-# A job is "active" if any cgroup.procs file under job_* contains PIDs.
 
+# Get total GPU count on this node (called once at startup)
+get_total_gpus() {
+    nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l
+}
+
+# Expand Slurm GPU index ranges: "0-3" → "0\n1\n2\n3", "0,2,5" → "0\n2\n5"
+expand_gpu_range() {
+    local input=$1
+    echo "$input" | tr ',' '\n' | while read -r part; do
+        if [[ "$part" == *-* ]]; then
+            seq "${part%-*}" "${part#*-}"
+        else
+            echo "$part"
+        fi
+    done
+}
+
+# Query Slurm for a job's GPU indices (returns range string like "0-3" or "4,5")
+get_job_gpus() {
+    local jobid=$1
+    scontrol show job "$jobid" -d 2>/dev/null | \
+        grep -oP 'GRES=gpu[^(]*\(IDX:\K[-0-9,.]+' | head -1
+}
+
+# Get all GPU indices currently allocated by Slurm jobs on this node
+get_allocated_gpus() {
+    if [[ ! -d "$CGROUP_BASE" ]]; then return; fi
+    for job_dir in "$CGROUP_BASE"/job_*; do
+        [[ -d "$job_dir" ]] || continue
+        # Only check jobs with active processes (stale cgroups have no PIDs)
+        if find "$job_dir" -name cgroup.procs -exec cat {} \; 2>/dev/null | grep -q .; then
+            local jobid
+            jobid=$(basename "$job_dir" | sed 's/job_//')
+            local gpu_range
+            gpu_range=$(get_job_gpus "$jobid")
+            if [[ -n "$gpu_range" ]]; then
+                expand_gpu_range "$gpu_range"
+            fi
+        fi
+    done | sort -un
+}
+
+# Compute free GPUs = all GPU indices minus Slurm-allocated
+get_free_gpus() {
+    local all_gpus
+    all_gpus=$(seq 0 $((TOTAL_GPUS - 1)))
+    local allocated
+    allocated=$(get_allocated_gpus)
+
+    if [[ -z "$allocated" ]]; then
+        echo "$all_gpus"
+    else
+        comm -23 <(echo "$all_gpus") <(echo "$allocated")
+    fi
+}
+
+# Check if a set of GPU indices overlaps with ACTIVE_GPUS
+check_overlap() {
+    local gpu_range=$1
+    local expanded
+    expanded=$(expand_gpu_range "$gpu_range")
+    while read -r gpu; do
+        [[ -z "$gpu" ]] && continue
+        if [[ ",$ACTIVE_GPUS," == *",$gpu,"* ]]; then
+            return 0  # overlap found
+        fi
+    done <<< "$expanded"
+    return 1  # no overlap
+}
+
+# Count active Slurm jobs (cgroup-based, no RPC)
 count_jobs() {
     local active=0
     if [[ -d "$CGROUP_BASE" ]]; then
-        while IFS= read -r job_dir; do
+        for job_dir in "$CGROUP_BASE"/job_*; do
             [[ -d "$job_dir" ]] || continue
             if find "$job_dir" -name cgroup.procs -exec cat {} \; 2>/dev/null | grep -q .; then
                 ((active++))
             fi
-        done < <(find "$CGROUP_BASE" -maxdepth 1 -type d -name 'job_*' 2>/dev/null)
+        done
     fi
     echo "$active"
 }
 
-list_jobs() {
+# List active job IDs from cgroups
+list_job_ids() {
     if [[ -d "$CGROUP_BASE" ]]; then
-        while IFS= read -r job_dir; do
+        for job_dir in "$CGROUP_BASE"/job_*; do
             [[ -d "$job_dir" ]] || continue
             if find "$job_dir" -name cgroup.procs -exec cat {} \; 2>/dev/null | grep -q .; then
                 basename "$job_dir" | sed 's/job_//'
             fi
-        done < <(find "$CGROUP_BASE" -maxdepth 1 -type d -name 'job_*' 2>/dev/null)
+        done
     fi
 }
 
@@ -173,14 +243,31 @@ stop_tunnel() {
 }
 
 # =============================================================================
-# LLM Server
+# LLM Server (GPU-aware)
 # =============================================================================
 
 start_server() {
-    log "Starting LLM server..."
+    # Find free GPUs via cgroup + scontrol
+    local free_gpus
+    free_gpus=$(get_free_gpus)
+    local free_count
+    free_count=$(echo "$free_gpus" | grep -c . || true)
 
-    "$LLM_BIN" serve "$MODEL_NAME" \
-        ${VLLM_ARGS:-} &
+    if (( free_count < NUM_GPUS )); then
+        log "Only $free_count free GPUs, need $NUM_GPUS"
+        return 1
+    fi
+
+    # Pick first NUM_GPUS free GPUs
+    ACTIVE_GPUS=$(echo "$free_gpus" | head -n "$NUM_GPUS" | tr '\n' ',' | sed 's/,$//')
+    log "Starting vLLM on GPUs: $ACTIVE_GPUS ($NUM_GPUS of $TOTAL_GPUS)"
+
+    # Override --tensor-parallel-size in model profile's VLLM_ARGS
+    local args="${VLLM_ARGS:-}"
+    args=$(echo "$args" | sed "s/--tensor-parallel-size [0-9]*/--tensor-parallel-size $NUM_GPUS/")
+
+    CUDA_VISIBLE_DEVICES="$ACTIVE_GPUS" "$LLM_BIN" serve "$MODEL_NAME" \
+        $args &
     SERVER_PID=$!
 
     log "Waiting for server to initialize..."
@@ -193,6 +280,7 @@ start_server() {
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then
             log "ERROR: Server died during startup"
             SERVER_PID=""
+            ACTIVE_GPUS=""
             return 1
         fi
         sleep 5
@@ -200,11 +288,12 @@ start_server() {
     done
 
     if kill -0 "$SERVER_PID" 2>/dev/null; then
-        log "Server started (PID: $SERVER_PID)"
+        log "Server started (PID: $SERVER_PID) on GPUs $ACTIVE_GPUS"
         return 0
     else
         log "ERROR: Server failed"
         SERVER_PID=""
+        ACTIVE_GPUS=""
         return 1
     fi
 }
@@ -213,22 +302,19 @@ stop_server() {
     if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
         log "Stopping server (PID: $SERVER_PID)..."
 
-        # Graceful shutdown
-        kill -TERM "$SERVER_PID" 2>/dev/null
-        sleep 3
+        # Kill immediately -- GPU memory must be freed before Slurm job OOMs
+        kill -KILL "$SERVER_PID" 2>/dev/null
+        wait "$SERVER_PID" 2>/dev/null
+        sleep 1
 
-        # Force kill if still running
-        if kill -0 "$SERVER_PID" 2>/dev/null; then
-            kill -KILL "$SERVER_PID" 2>/dev/null
-            wait "$SERVER_PID" 2>/dev/null
-        fi
-        sleep 3
-        if [[ $(list_jobs) -gt 0 ]]; then
-            pkill -u "$USER"
+        # Nuclear option: if Slurm jobs are waiting for our GPUs, kill everything
+        if [[ $(count_jobs) -gt 0 ]]; then
+            pkill -u "$USER" 2>/dev/null || true
         fi
     fi
     SERVER_PID=""
-    # Clean up vllm processes
+    ACTIVE_GPUS=""
+    # Clean up any orphaned vllm processes
     pkill -f "vllm serve" 2>/dev/null || true
 }
 
@@ -237,11 +323,6 @@ stop_server() {
 # =============================================================================
 
 start_all() {
-    if [[ $(count_jobs) -gt 0 ]]; then
-        log "Jobs detected, aborting startup"
-        return 1
-    fi
-
     if ! start_server; then
         return 1
     fi
@@ -251,51 +332,45 @@ start_all() {
         return 1
     fi
 
-    local gpu_count=$(nvidia-smi -L 2>/dev/null | wc -l || echo "?")
     notify "vLLM Server Online" \
-        "$HOSTNAME_SHORT: ${gpu_count} GPUs
+        "$HOSTNAME_SHORT: GPUs $ACTIVE_GPUS ($NUM_GPUS of $TOTAL_GPUS)
 https://${TUNNEL_HOSTNAME}" \
         3
     return 0
 }
 
 stop_all() {
-    # Kill any inotify watcher
-    if [[ -n "$INOTIFY_PID" ]] && kill -0 "$INOTIFY_PID" 2>/dev/null; then
-        kill -TERM "$INOTIFY_PID" 2>/dev/null
-        wait "$INOTIFY_PID" 2>/dev/null
-    fi
-    INOTIFY_PID=""
-
     stop_tunnel
     stop_server
     sleep 2
 }
 
 # =============================================================================
-# Wait Functions (inotify with polling fallback)
+# Wait for New Job (inotify with polling fallback)
 # =============================================================================
+#
+# Blocks until a NEW Slurm job cgroup appears. Returns:
+#   0 = new job detected
+#   1 = server died (need restart)
 
 wait_for_job_inotify() {
-    log "Watching for jobs (inotify)..."
+    local baseline=$1
+    log "Watching for new jobs (inotify) on GPUs $ACTIVE_GPUS... (baseline: $baseline jobs)"
 
-    # inotifywait blocks until a job_* directory is created
-    # We watch for CREATE events on directories matching job_*
     while true; do
-        # Use timeout to periodically check server health
-        local event=$("$INOTIFYWAIT" -t 10 -q -e create --format '%f' "$CGROUP_BASE" 2>/dev/null || true)
+        local event
+        event=$("$INOTIFYWAIT" -t 10 -q -e create --format '%f' "$CGROUP_BASE" 2>/dev/null || true)
 
-        # Check if server is still running
+        # Check server health
         if [[ -n "$SERVER_PID" ]] && ! kill -0 "$SERVER_PID" 2>/dev/null; then
             log "Server died"
             return 1
         fi
 
-        # If event matches job_*, check if it has active processes
+        # If a job_* directory was created, check if job count increased
         if [[ "$event" =~ ^job_[0-9]+ ]]; then
-            # Brief delay for processes to populate
             sleep 0.5
-            if [[ $(count_jobs) -gt 0 ]]; then
+            if (( $(count_jobs) > baseline )); then
                 return 0
             fi
         fi
@@ -303,51 +378,78 @@ wait_for_job_inotify() {
 }
 
 wait_for_job_polling() {
-    log "Watching for jobs (polling every ${POLL_INTERVAL}s)..."
+    local baseline=$1
+    log "Watching for new jobs (polling ${POLL_INTERVAL}s) on GPUs $ACTIVE_GPUS... (baseline: $baseline jobs)"
 
-    while [[ $(count_jobs) -eq 0 ]]; do
+    while true; do
         sleep "$POLL_INTERVAL"
+
         if [[ -n "$SERVER_PID" ]] && ! kill -0 "$SERVER_PID" 2>/dev/null; then
             log "Server died"
             return 1
         fi
+
+        if (( $(count_jobs) > baseline )); then
+            return 0
+        fi
     done
-    return 0
 }
 
+# Wait until job count exceeds baseline. Pass current job count as $1.
 wait_for_job() {
+    local baseline=${1:-0}
     if [[ "$USE_INOTIFY" == "true" ]]; then
-        wait_for_job_inotify
+        wait_for_job_inotify "$baseline"
     else
-        wait_for_job_polling
+        wait_for_job_polling "$baseline"
     fi
 }
 
-wait_for_no_jobs_inotify() {
-    log "Waiting for jobs to finish (inotify)..."
+# =============================================================================
+# Handle New Job (determine GPU conflict via scontrol)
+# =============================================================================
+#
+# Called when cgroup detects a new job. Queries scontrol for GPU assignment.
+# Returns:
+#   0 = conflict (job overlaps our GPUs) -- must yield
+#   1 = no conflict (job on other GPUs) -- keep serving
 
-    while [[ $(count_jobs) -gt 0 ]]; do
-        # Watch for DELETE events (job directory removal)
-        # Timeout every 30s to recheck in case we missed an event
-        "$INOTIFYWAIT" -t 30 -q -e delete "$CGROUP_BASE" 2>/dev/null || true
-    done
-    log "All jobs finished"
-}
-
-wait_for_no_jobs_polling() {
-    log "Waiting for jobs to finish (polling)..."
-    while [[ $(count_jobs) -gt 0 ]]; do
-        sleep "$POLL_INTERVAL"
-    done
-    log "All jobs finished"
-}
-
-wait_for_no_jobs() {
-    if [[ "$USE_INOTIFY" == "true" ]]; then
-        wait_for_no_jobs_inotify
-    else
-        wait_for_no_jobs_polling
+handle_new_job() {
+    # On nodes where we use ALL GPUs, any GPU job is a guaranteed conflict
+    if (( NUM_GPUS >= TOTAL_GPUS )); then
+        log "Using all $TOTAL_GPUS GPUs -- any job is a conflict"
+        return 0
     fi
+
+    log "New job detected. Checking GPU assignment via scontrol..."
+
+    # Find all active jobs and check their GPU assignments
+    local conflict=false
+    while read -r jobid; do
+        [[ -z "$jobid" ]] && continue
+        local job_gpus
+        job_gpus=$(get_job_gpus "$jobid")
+
+        if [[ -z "$job_gpus" ]]; then
+            log "  Job $jobid: no GPU allocation (non-GPU job)"
+            continue
+        fi
+
+        if check_overlap "$job_gpus"; then
+            log "  Job $jobid: GPUs $job_gpus -- CONFLICTS with ours ($ACTIVE_GPUS)"
+            conflict=true
+            break
+        else
+            log "  Job $jobid: GPUs $job_gpus -- no conflict"
+        fi
+    done < <(list_job_ids)
+
+    if $conflict; then
+        return 0
+    fi
+
+    log "All jobs on other GPUs -- continuing to serve"
+    return 1
 }
 
 # =============================================================================
@@ -367,46 +469,72 @@ trap cleanup SIGTERM SIGINT SIGHUP
 # Main Loop
 # =============================================================================
 
+TOTAL_GPUS=$(get_total_gpus)
+
 log "=========================================="
 log "LLM Watchdog on $HOSTNAME_SHORT"
-log "  Model:  ${MODEL_NAME}"
-log "  Venv:   ${LLM_VENV}"
+log "  Model:     ${MODEL_NAME}"
+log "  Venv:      ${LLM_VENV}"
 if [[ "${CUDA_SETUP:-false}" == "true" ]]; then
-    log "  CUDA:   CUDA_HOME=${CUDA_HOME}, LD_LIBRARY_PATH prepended"
+    log "  CUDA:      CUDA_HOME=${CUDA_HOME}, LD_LIBRARY_PATH prepended"
 fi
-log "  Cgroup: $CGROUP_BASE"
-log "  URL:    https://$TUNNEL_HOSTNAME"
+log "  GPUs:      ${NUM_GPUS} of ${TOTAL_GPUS} total"
+log "  Cgroup:    $CGROUP_BASE"
+log "  URL:       https://$TUNNEL_HOSTNAME"
 if [[ "$USE_INOTIFY" == "true" ]]; then
-    log "  Detection: inotify (instant)"
+    log "  Detection: cgroup (inotify) + scontrol"
 else
-    log "  Detection: polling (${POLL_INTERVAL}s)"
+    log "  Detection: cgroup (polling ${POLL_INTERVAL}s) + scontrol"
 fi
 log "=========================================="
 
 while true; do
-    job_count=$(count_jobs)
+    # SCANNING: wait for enough free GPUs
+    free_gpus=$(get_free_gpus)
+    free_count=$(echo "$free_gpus" | grep -c . || true)
 
-    if [[ $job_count -gt 0 ]]; then
-        log "Found $job_count job(s): $(list_jobs | tr '\n' ' ')"
-        DOWNTIME_START=$(date +%s)
-        wait_for_no_jobs
+    if (( free_count < NUM_GPUS )); then
+        if [[ $DOWNTIME_START -eq 0 ]]; then
+            DOWNTIME_START=$(date +%s)
+            log "Only $free_count of $NUM_GPUS GPUs free. Waiting..."
+            log "  Allocated: $(get_allocated_gpus | tr '\n' ',' | sed 's/,$//')"
+        fi
+        sleep 5  # check every 5s while scanning (scontrol calls are infrequent)
+        continue
     fi
 
+    # STARTING: launch vLLM + tunnel on free GPUs
     if start_all; then
         if [[ $DOWNTIME_START -gt 0 ]]; then
             log "Was down for $(($(date +%s) - DOWNTIME_START))s"
             DOWNTIME_START=0
         fi
 
-        if wait_for_job; then
-            log "Job detected: $(list_jobs | tr '\n' ' ')"
-            stop_all
-            DOWNTIME_START=$(date +%s)
-            notify "vLLM Server Yielding" "$HOSTNAME_SHORT: Slurm job detected" 4
-        else
-            stop_all
-            sleep 5
-        fi
+        # SERVING: watch cgroups for new jobs
+        local known_jobs
+        known_jobs=$(count_jobs)
+        while true; do
+            if wait_for_job "$known_jobs"; then
+                # New job detected -- check GPU conflict via scontrol
+                if handle_new_job; then
+                    # CONFLICT: yield our GPUs
+                    log "GPU conflict -- yielding GPUs $ACTIVE_GPUS"
+                    stop_all
+                    DOWNTIME_START=$(date +%s)
+                    notify "vLLM Server Yielding" \
+                        "$HOSTNAME_SHORT: Slurm job on our GPUs ($ACTIVE_GPUS)" 4
+                    break
+                fi
+                # No conflict -- update baseline, keep serving
+                known_jobs=$(count_jobs)
+            else
+                # Server died
+                log "Server died, restarting..."
+                stop_all
+                sleep 5
+                break
+            fi
+        done
     else
         log "Startup failed, retrying in 30s..."
         sleep 30

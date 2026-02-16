@@ -194,7 +194,7 @@ start_server() {
         return 1
     fi
 
-    ACTIVE_GPUS=$(echo "$free_gpus" | head -n "$NUM_GPUS" | tr '\n' ',' | sed 's/,$//')
+    ACTIVE_GPUS=$(echo "$free_gpus" | tail -n "$NUM_GPUS" | tr '\n' ',' | sed 's/,$//')
     log "Starting vLLM on GPUs: $ACTIVE_GPUS ($NUM_GPUS of $TOTAL_GPUS)"
 
     local args="${VLLM_ARGS:-}"

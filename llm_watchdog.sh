@@ -511,7 +511,6 @@ while true; do
         fi
 
         # SERVING: watch cgroups for new jobs
-        local known_jobs
         known_jobs=$(count_jobs)
         while true; do
             if wait_for_job "$known_jobs"; then

@@ -185,6 +185,11 @@ list_job_ids() {
     fi
 }
 
+# Snapshot of active job IDs (cheap, no scontrol -- just cgroup directory names)
+get_job_snapshot() {
+    list_job_ids | sort -n | tr '\n' ','
+}
+
 # =============================================================================
 # Notifications
 # =============================================================================
@@ -346,16 +351,16 @@ stop_all() {
 }
 
 # =============================================================================
-# Wait for New Job (inotify with polling fallback)
+# Wait for Job Change (inotify with polling fallback)
 # =============================================================================
 #
-# Blocks until a NEW Slurm job cgroup appears. Returns:
-#   0 = new job detected
+# Blocks until the set of active Slurm jobs changes. Returns:
+#   0 = job set changed (caller should check GPU conflict)
 #   1 = server died (need restart)
 
-wait_for_job_inotify() {
-    local baseline=$1
-    log "Watching for new jobs (inotify) on GPUs $ACTIVE_GPUS... (baseline: $baseline jobs)"
+wait_for_change_inotify() {
+    local last_snapshot="$1"
+    log "Watching for job changes (inotify) on GPUs $ACTIVE_GPUS..."
 
     while true; do
         local event
@@ -367,19 +372,24 @@ wait_for_job_inotify() {
             return 1
         fi
 
-        # If a job_* directory was created, check if job count increased
+        # inotify caught a new job directory
         if [[ "$event" =~ ^job_[0-9]+ ]]; then
             sleep 0.5
-            if (( $(count_jobs) > baseline )); then
-                return 0
-            fi
+            return 0
+        fi
+
+        # Defensive: check on timeout in case events were missed
+        local current
+        current=$(get_job_snapshot)
+        if [[ "$current" != "$last_snapshot" ]]; then
+            return 0
         fi
     done
 }
 
-wait_for_job_polling() {
-    local baseline=$1
-    log "Watching for new jobs (polling ${POLL_INTERVAL}s) on GPUs $ACTIVE_GPUS... (baseline: $baseline jobs)"
+wait_for_change_polling() {
+    local last_snapshot="$1"
+    log "Watching for job changes (polling ${POLL_INTERVAL}s) on GPUs $ACTIVE_GPUS..."
 
     while true; do
         sleep "$POLL_INTERVAL"
@@ -389,30 +399,33 @@ wait_for_job_polling() {
             return 1
         fi
 
-        if (( $(count_jobs) > baseline )); then
+        local current
+        current=$(get_job_snapshot)
+        if [[ "$current" != "$last_snapshot" ]]; then
             return 0
         fi
     done
 }
 
-# Wait until job count exceeds baseline. Pass current job count as $1.
-wait_for_job() {
-    local baseline=${1:-0}
+# Wait until the set of active jobs changes. Pass current snapshot as $1.
+wait_for_change() {
+    local last_snapshot="${1:-}"
     if [[ "$USE_INOTIFY" == "true" ]]; then
-        wait_for_job_inotify "$baseline"
+        wait_for_change_inotify "$last_snapshot"
     else
-        wait_for_job_polling "$baseline"
+        wait_for_change_polling "$last_snapshot"
     fi
 }
 
 # =============================================================================
-# Handle New Job (determine GPU conflict via scontrol)
+# Check GPU Conflict (scontrol)
 # =============================================================================
 #
-# Called when cgroup detects a new job. Queries scontrol for GPU assignment.
+# Called when the set of active jobs changes. Queries scontrol for GPU
+# assignments across all active jobs.
 # Returns:
-#   0 = conflict (job overlaps our GPUs) -- must yield
-#   1 = no conflict (job on other GPUs) -- keep serving
+#   0 = conflict (a job overlaps our GPUs) -- must yield
+#   1 = no conflict (all jobs on other GPUs) -- keep serving
 
 handle_new_job() {
     # On nodes where we use ALL GPUs, any GPU job is a guaranteed conflict
@@ -421,7 +434,7 @@ handle_new_job() {
         return 0
     fi
 
-    log "New job detected. Checking GPU assignment via scontrol..."
+    log "Job change detected. Checking GPU assignments via scontrol..."
 
     # Find all active jobs and check their GPU assignments
     local conflict=false
@@ -510,11 +523,11 @@ while true; do
             DOWNTIME_START=0
         fi
 
-        # SERVING: watch cgroups for new jobs
-        known_jobs=$(count_jobs)
+        # SERVING: watch cgroups for job changes
+        snapshot=$(get_job_snapshot)
         while true; do
-            if wait_for_job "$known_jobs"; then
-                # New job detected -- check GPU conflict via scontrol
+            if wait_for_change "$snapshot"; then
+                # Job set changed -- check GPU conflict via scontrol
                 if handle_new_job; then
                     # CONFLICT: yield our GPUs
                     log "GPU conflict -- yielding GPUs $ACTIVE_GPUS"
@@ -524,8 +537,8 @@ while true; do
                         "$HOSTNAME_SHORT: Slurm job on our GPUs ($ACTIVE_GPUS)" 4
                     break
                 fi
-                # No conflict -- update baseline, keep serving
-                known_jobs=$(count_jobs)
+                # No conflict -- update snapshot, keep serving
+                snapshot=$(get_job_snapshot)
             else
                 # Server died
                 log "Server died, restarting..."

@@ -17,6 +17,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${1:-$SCRIPT_DIR/config.env}"
 MODEL_FILE="${2:-$SCRIPT_DIR/active-model.env}"
+AVAILABLE_NODES_ARG="${3:-}"
 
 if [[ -f "$CONFIG_FILE" ]]; then
     source "$CONFIG_FILE"
@@ -31,6 +32,14 @@ if [[ -f "$MODEL_FILE" ]]; then
 else
     echo "ERROR: No active model. Run: ./switch-model.sh <model-name>"
     exit 1
+fi
+
+# Parse available nodes - use arg if provided, otherwise use config
+AVAILABLE_NODES=""
+if [[ -n "$AVAILABLE_NODES_ARG" ]]; then
+    AVAILABLE_NODES="$AVAILABLE_NODES_ARG"
+elif [[ -n "${AVAILABLE_NODES[*]:-}" ]]; then
+    AVAILABLE_NODES="${AVAILABLE_NODES[*]}"
 fi
 
 # =============================================================================
@@ -191,6 +200,49 @@ get_job_snapshot() {
 }
 
 # =============================================================================
+# Node GPU Status (sinfo)
+# =============================================================================
+
+get_node_gpu_status() {
+    local nodes="$1"
+    local required_gpus=$2
+
+    for node in $nodes; do
+        local sinfo_line
+        sinfo_line=$(sinfo -NO "Gres:GresUsed,NodeList" -n "$node" 2>/dev/null | tail -1)
+        
+        [[ -z "$sinfo_line" ]] && continue
+
+        local gres_used
+        gres_used=$(echo "$sinfo_line" | grep -oP 'GRES_USED=\Kgpu:[^ ]+' || true)
+        
+        local total_gpus=0
+        local used_gpus=0
+
+        if [[ "$sinfo_line" =~ gpu:h200:([0-9]+) ]]; then
+            total_gpus="${BASH_REMATCH[1]}"
+        elif [[ "$sinfo_line" =~ gpu:([0-9]+) ]]; then
+            total_gpus="${BASH_REMATCH[1]}"
+        fi
+
+        if [[ -n "$gres_used" ]]; then
+            if [[ "$gres_used" =~ IDX:([0-9,\-]+) ]]; then
+                local idx="${BASH_REMATCH[1]}"
+                used_gpus=$(expand_gpu_range "$idx" | wc -l)
+            else
+                used_gpus=$total_gpus
+            fi
+        fi
+
+        local free_gpus=$((total_gpus - used_gpus))
+        
+        if [[ $free_gpus -ge $required_gpus ]]; then
+            echo "$node:$free_gpus"
+        fi
+    done | head -1
+}
+
+# =============================================================================
 # Notifications
 # =============================================================================
 
@@ -348,6 +400,63 @@ stop_all() {
     stop_tunnel
     stop_server
     sleep 2
+}
+
+# =============================================================================
+# Migration
+# =============================================================================
+
+migrate_to_node() {
+    log "Migration triggered: killing vLLM and preparing to move..."
+    
+    stop_server
+    
+    log "Killing all user processes on current node..."
+    pkill -u "$USER" 2>/dev/null || true
+    sleep 2
+    
+    if [[ -z "$AVAILABLE_NODES" ]]; then
+        log "No available nodes configured"
+        notify "No nodes available, permanently stopping" \
+            "$HOSTNAME_SHORT: No nodes in AVAILABLE_NODES" 4
+        pkill -u "$USER" 2>/dev/null || true
+        exit 1
+    fi
+    
+    local reverse_nodes
+    reverse_nodes=$(echo "$AVAILABLE_NODES" | tr ' ' '\n' | tac | tr '\n' ' ')
+    
+    log "Querying sinfo for free GPUs on: $reverse_nodes"
+    local target
+    target=$(get_node_gpu_status "$reverse_nodes" "$NUM_GPUS")
+    
+    if [[ -z "$target" ]]; then
+        log "No nodes available with $NUM_GPUS free GPUs"
+        notify "No nodes available, permanently stopping" \
+            "$HOSTNAME_SHORT: No nodes with $NUM_GPUS GPUs" 4
+        pkill -u "$USER" 2>/dev/null || true
+        exit 1
+    fi
+    
+    local new_node="${target%%:*}"
+    log "Starting new worker on $new_node..."
+    
+    ssh -o ConnectTimeout=30 "$new_node" "tmux new-session -d -s $SESSION_NAME '$SCRIPT_DIR/llm_watchdog.sh $SCRIPT_DIR/config.env $AVAILABLE_NODES'" 2>/dev/null
+    local ssh_status=$?
+    
+    if [[ $ssh_status -ne 0 ]]; then
+        log "SSH failed to $new_node"
+        notify "SSH failed to $new_node, permanently stopping" \
+            "$HOSTNAME_SHORT: SSH failed" 4
+        pkill -u "$USER" 2>/dev/null || true
+        exit 1
+    fi
+    
+    notify "Migrated to $new_node" \
+        "$HOSTNAME_SHORT -> $new_node" 3
+    
+    log "Migration complete to $new_node, exiting..."
+    exit 0
 }
 
 # =============================================================================
@@ -529,12 +638,9 @@ while true; do
             if wait_for_change "$snapshot"; then
                 # Job set changed -- check GPU conflict via scontrol
                 if handle_new_job; then
-                    # CONFLICT: yield our GPUs
-                    log "GPU conflict -- yielding GPUs $ACTIVE_GPUS"
-                    stop_all
-                    DOWNTIME_START=$(date +%s)
-                    notify "vLLM Server Yielding" \
-                        "$HOSTNAME_SHORT: Slurm job on our GPUs ($ACTIVE_GPUS)" 4
+                    # CONFLICT: migrate to another node
+                    log "GPU conflict -- migrating to another node"
+                    migrate_to_node
                     break
                 fi
                 # No conflict -- update snapshot, keep serving

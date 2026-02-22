@@ -12,16 +12,30 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NODE="${1:-}"
 SESSION_NAME="llm_watchdog"
 
+# Load available nodes from config if not provided
+if [[ -z "${2:-}" ]]; then
+    source "$SCRIPT_DIR/config.env" 2>/dev/null || true
+    NODE_LIST="${AVAILABLE_NODES[*]:-}"
+else
+    NODE_LIST="$2"
+fi
+
 # If node specified, SSH to it
 if [[ -n "$NODE" ]]; then
     echo "Starting watchdog on $NODE..."
     ssh "$NODE" "tmux kill-session -t $SESSION_NAME 2>/dev/null || true; \
-                 tmux new-session -d -s $SESSION_NAME '$SCRIPT_DIR/llm_watchdog.sh $SCRIPT_DIR/config.env'"
+                 tmux new-session -d -s $SESSION_NAME '$SCRIPT_DIR/llm_watchdog.sh $SCRIPT_DIR/config.env $NODE_LIST' 2>&1; \
+                 sleep 2; \
+                 tmux capture-pane -t $SESSION_NAME -p | tail -20"
     echo "Done. View with: ssh $NODE \"tmux attach -t $SESSION_NAME\""
 else
     # Running locally
     echo "Starting watchdog locally..."
     tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
-    tmux new-session -d -s "$SESSION_NAME" "$SCRIPT_DIR/llm_watchdog.sh $SCRIPT_DIR/config.env"
+    tmux new-session -d -s "$SESSION_NAME" "$SCRIPT_DIR/llm_watchdog.sh $SCRIPT_DIR/config.env $NODE_LIST"
+    sleep 2
+    echo "--- Last 20 lines of session ---"
+    tmux capture-pane -t "$SESSION_NAME" -p | tail -20
+    echo "--- End ---"
     echo "Done. View with: tmux attach -t $SESSION_NAME"
 fi

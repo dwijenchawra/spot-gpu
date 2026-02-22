@@ -39,11 +39,12 @@ else
 fi
 
 # Parse available nodes - use arg if provided, otherwise use config
+# Convert comma-separated to space-separated
 AVAILABLE_NODES=""
 if [[ -n "$AVAILABLE_NODES_ARG" ]]; then
-    AVAILABLE_NODES="$AVAILABLE_NODES_ARG"
-elif [[ -n "${AVAILABLE_NODES[*]:-}" ]]; then
-    AVAILABLE_NODES="${AVAILABLE_NODES[*]}"
+    AVAILABLE_NODES="${AVAILABLE_NODES_ARG//,/ }"
+elif [[ -n "${AVAILABLE_NODES:-}" ]]; then
+    AVAILABLE_NODES="${AVAILABLE_NODES//,/ }"
 fi
 
 # =============================================================================

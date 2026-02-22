@@ -15,9 +15,13 @@ SESSION_NAME="llm_watchdog"
 # Load available nodes from config if not provided
 if [[ -z "${2:-}" ]]; then
     source "$SCRIPT_DIR/config.env" 2>/dev/null || true
+    # Debug: show what's in AVAILABLE_NODES
+    echo "DEBUG: AVAILABLE_NODES=${AVAILABLE_NODES[*]:-}" >&2
     # Convert array to comma-separated string (works in both bash and zsh)
     if [[ -n "${AVAILABLE_NODES:-}" ]]; then
-        NODE_LIST="${AVAILABLE_NODES// /,}"
+        NODE_LIST="${AVAILABLE_NODES[*]}"
+        NODE_LIST="${NODE_LIST// /,}"
+        echo "DEBUG: NODE_LIST=$NODE_LIST" >&2
     else
         NODE_LIST=""
     fi

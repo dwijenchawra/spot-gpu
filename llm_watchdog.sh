@@ -8,7 +8,7 @@
 # Notifies: ntfy.sh
 #
 
-set -uo pipefail
+set -euxuo pipefail
 
 # =============================================================================
 # Configuration

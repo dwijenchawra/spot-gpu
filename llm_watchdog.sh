@@ -8,7 +8,7 @@
 # Notifies: ntfy.sh
 #
 
-set -euxuo pipefail
+set -uo pipefail
 
 # =============================================================================
 # Configuration
@@ -19,13 +19,10 @@ CONFIG_FILE="${1:-$SCRIPT_DIR/config.env}"
 MODEL_FILE="${2:-$SCRIPT_DIR/active-model.env}"
 AVAILABLE_NODES_ARG="${3:-}"
 
-echo "[$(date)] Starting llm_watchdog.sh with args: $@" >> /tmp/llm_watchdog.log
-
 if [[ -f "$CONFIG_FILE" ]]; then
     source "$CONFIG_FILE"
 else
     echo "ERROR: Config file not found: $CONFIG_FILE"
-    echo "ERROR: Config file not found: $CONFIG_FILE" >> /tmp/llm_watchdog.log
     exit 1
 fi
 
@@ -34,7 +31,6 @@ if [[ -f "$MODEL_FILE" ]]; then
     source "$MODEL_FILE"
 else
     echo "ERROR: No active model. Run: ./switch-model.sh <model-name>"
-    echo "ERROR: No active model. Run: ./switch-model.sh <model-name>" >> /tmp/llm_watchdog.log
     exit 1
 fi
 
@@ -95,11 +91,8 @@ DOWNTIME_START=0
 # Logging
 # =============================================================================
 
-# Log to both stdout and a log file
 log() {
-    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
-    echo "$msg"
-    echo "$msg" >> /tmp/llm_watchdog.log
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
 }
 
 # =============================================================================

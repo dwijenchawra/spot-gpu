@@ -43,6 +43,18 @@ elif [[ -n "${AVAILABLE_NODES:-}" ]]; then
     AVAILABLE_NODES="${AVAILABLE_NODES//,/ }"
 fi
 
+# Test mode: artificially trigger migration after N seconds
+TEST_MODE=false
+TEST_DELAY=0
+for arg in "$@"; do
+    if [[ "$arg" == --test* ]]; then
+        TEST_MODE=true
+        if [[ "$arg" =~ --test[=[:space:]]?([0-9]+) ]]; then
+            TEST_DELAY="${BASH_REMATCH[1]}"
+        fi
+    fi
+done
+
 # =============================================================================
 # Environment Resolution (per-node CUDA setup from config.env)
 # =============================================================================
@@ -635,6 +647,16 @@ while true; do
 
         # SERVING: watch cgroups for job changes
         snapshot=$(get_job_snapshot)
+        
+        # Test mode: trigger migration after delay
+        if [[ "$TEST_MODE" == "true" ]]; then
+            log "TEST MODE: Will trigger migration in ${TEST_DELAY}s..."
+            sleep "$TEST_DELAY"
+            log "TEST MODE: Triggering migration now"
+            migrate_to_node
+            break
+        fi
+        
         while true; do
             if wait_for_change "$snapshot"; then
                 # Job set changed -- check GPU conflict via scontrol

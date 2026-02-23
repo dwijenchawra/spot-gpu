@@ -15,13 +15,9 @@ SESSION_NAME="llm_watchdog"
 # Load available nodes from config if not provided
 if [[ -z "${2:-}" ]]; then
     source "$SCRIPT_DIR/config.env" 2>/dev/null || true
-    # Debug: show what's in AVAILABLE_NODES
-    echo "DEBUG: AVAILABLE_NODES=${AVAILABLE_NODES[*]:-}" >&2
-    # Convert array to comma-separated string (works in both bash and zsh)
     if [[ -n "${AVAILABLE_NODES:-}" ]]; then
         NODE_LIST="${AVAILABLE_NODES[*]}"
         NODE_LIST="${NODE_LIST// /,}"
-        echo "DEBUG: NODE_LIST=$NODE_LIST" >&2
     else
         NODE_LIST=""
     fi
@@ -33,7 +29,7 @@ fi
 if [[ -n "$NODE" ]]; then
     echo "Starting watchdog on $NODE..."
     ssh "$NODE" "tmux kill-session -t $SESSION_NAME 2>/dev/null || true; \
-                 tmux new-session -d -s $SESSION_NAME '$SCRIPT_DIR/llm_watchdog.sh $SCRIPT_DIR/config.env $NODE_LIST' 2>&1; \
+                 tmux new-session -d -s $SESSION_NAME '$SCRIPT_DIR/llm_watchdog.sh $SCRIPT_DIR/config.env $SCRIPT_DIR/active-model.env $NODE_LIST' 2>&1; \
                  sleep 2; \
                  tmux capture-pane -t $SESSION_NAME -p | tail -20"
     echo "Done. View with: ssh $NODE \"tmux attach -t $SESSION_NAME\""
@@ -41,7 +37,7 @@ else
     # Running locally
     echo "Starting watchdog locally..."
     tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
-    tmux new-session -d -s "$SESSION_NAME" "$SCRIPT_DIR/llm_watchdog.sh $SCRIPT_DIR/config.env $NODE_LIST"
+    tmux new-session -d -s "$SESSION_NAME" "$SCRIPT_DIR/llm_watchdog.sh $SCRIPT_DIR/config.env $SCRIPT_DIR/active-model.env $NODE_LIST"
     sleep 2
     echo "--- Last 20 lines of session ---"
     tmux capture-pane -t "$SESSION_NAME" -p | tail -20

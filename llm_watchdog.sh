@@ -439,39 +439,68 @@ migrate_to_node() {
     local reverse_nodes
     reverse_nodes=$(echo "$AVAILABLE_NODES" | tr ' ' '\n' | tac | tr '\n' ' ')
     
-    log "Querying sinfo for free GPUs on: $reverse_nodes"
-    local target
-    target=$(get_node_gpu_status "$reverse_nodes" "$NUM_GPUS")
+    log "Searching for node with $NUM_GPUS free GPUs (reverse priority: $reverse_nodes)"
     
-    if [[ -z "$target" ]]; then
-        log "No nodes available with $NUM_GPUS free GPUs"
-        notify "No nodes available, permanently stopping" \
-            "$HOSTNAME_SHORT: No nodes with $NUM_GPUS GPUs" 4
-        pkill -u "$USER" 2>/dev/null || true
-        exit 1
-    fi
+    for node in $reverse_nodes; do
+        log "Checking $node..."
+        local sinfo_line
+        sinfo_line=$(sinfo -NO "Gres:GresUsed,NodeList" -n "$node" 2>/dev/null | tail -1)
+        
+        if [[ -z "$sinfo_line" ]]; then
+            log "  $node: sinfo returned empty"
+            continue
+        fi
+        
+        local gres_used
+        gres_used=$(echo "$sinfo_line" | grep -oP 'GRES_USED=\Kgpu:[^ ]+' || true)
+        
+        local total_gpus=0
+        local used_gpus=0
+
+        if [[ "$sinfo_line" =~ gpu:h200:([0-9]+) ]]; then
+            total_gpus="${BASH_REMATCH[1]}"
+        elif [[ "$sinfo_line" =~ gpu:([0-9]+) ]]; then
+            total_gpus="${BASH_REMATCH[1]}"
+        fi
+
+        if [[ -n "$gres_used" ]]; then
+            if [[ "$gres_used" =~ IDX:([0-9,\-]+) ]]; then
+                local idx="${BASH_REMATCH[1]}"
+                used_gpus=$(expand_gpu_range "$idx" | wc -l)
+            else
+                used_gpus=$total_gpus
+            fi
+        fi
+
+        local free_gpus=$((total_gpus - used_gpus))
+        log "  $node: $total_gpus total, $used_gpus used, $free_gpus free"
+        
+        if [[ $free_gpus -ge $NUM_GPUS ]]; then
+            log "Found $node with $free_gpus free GPUs (need $NUM_GPUS)"
+            
+            # Notify BEFORE SSH so we see where we're going
+            notify "Migrating to $node" \
+                "$HOSTNAME_SHORT -> $node" 3
+            
+            ssh -o ConnectTimeout=30 "$node" "tmux new-session -d -s $SESSION_NAME '$SCRIPT_DIR/llm_watchdog.sh $SCRIPT_DIR/config.env $AVAILABLE_NODES'" 2>/dev/null
+            local ssh_status=$?
+            
+            if [[ $ssh_status -ne 0 ]]; then
+                log "SSH failed to $node, trying next node..."
+                continue
+            fi
+            
+            log "Migration complete to $node, exiting..."
+            sleep 1
+            exit 0
+        fi
+    done
     
-    local new_node="${target%%:*}"
-    log "Starting new worker on $new_node..."
-    
-    # Notify BEFORE SSH so we see where we're going
-    notify "Migrating to $new_node" \
-        "$HOSTNAME_SHORT -> $new_node" 3
-    
-    ssh -o ConnectTimeout=30 "$new_node" "tmux new-session -d -s $SESSION_NAME '$SCRIPT_DIR/llm_watchdog.sh $SCRIPT_DIR/config.env $AVAILABLE_NODES'" 2>/dev/null
-    local ssh_status=$?
-    
-    if [[ $ssh_status -ne 0 ]]; then
-        log "SSH failed to $new_node"
-        notify "SSH failed to $new_node, permanently stopping" \
-            "$HOSTNAME_SHORT: SSH failed" 4
-        pkill -u "$USER" 2>/dev/null || true
-        exit 1
-    fi
-    
-    log "Migration complete to $new_node, exiting..."
-    sleep 1
-    exit 0
+    log "No nodes available with $NUM_GPUS free GPUs"
+    notify "No nodes available, permanently stopping" \
+        "$HOSTNAME_SHORT: No nodes with $NUM_GPUS GPUs" 4
+    pkill -u "$USER" 2>/dev/null || true
+    exit 1
 }
 
 # =============================================================================

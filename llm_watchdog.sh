@@ -454,6 +454,10 @@ migrate_to_node() {
     local new_node="${target%%:*}"
     log "Starting new worker on $new_node..."
     
+    # Notify BEFORE SSH so we see where we're going
+    notify "Migrating to $new_node" \
+        "$HOSTNAME_SHORT -> $new_node" 3
+    
     ssh -o ConnectTimeout=30 "$new_node" "tmux new-session -d -s $SESSION_NAME '$SCRIPT_DIR/llm_watchdog.sh $SCRIPT_DIR/config.env $AVAILABLE_NODES'" 2>/dev/null
     local ssh_status=$?
     
@@ -465,10 +469,8 @@ migrate_to_node() {
         exit 1
     fi
     
-    notify "Migrated to $new_node" \
-        "$HOSTNAME_SHORT -> $new_node" 3
-    
     log "Migration complete to $new_node, exiting..."
+    sleep 1
     exit 0
 }
 

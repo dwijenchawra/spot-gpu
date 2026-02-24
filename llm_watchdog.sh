@@ -420,7 +420,7 @@ stop_all() {
 # =============================================================================
 
 migrate_to_node() {
-    log "Migration triggered: killing vLLM and preparing to move..."
+    log "Migration triggered: conflict on GPUs $ACTIVE_GPUS, killing vLLM..."
     
     stop_server
     
@@ -439,7 +439,10 @@ migrate_to_node() {
     local reverse_nodes
     reverse_nodes=$(echo "$AVAILABLE_NODES" | tr ' ' '\n' | tac | tr '\n' ' ')
     
-    log "Searching for node with $NUM_GPUS free GPUs (reverse priority: $reverse_nodes)"
+    log "=== Searching for node with $NUM_GPUS free GPUs (reverse priority: $reverse_nodes) ==="
+    
+    local found_node=""
+    local found_free=""
     
     for node in $reverse_nodes; do
         log "Checking $node..."
@@ -447,7 +450,7 @@ migrate_to_node() {
         sinfo_line=$(sinfo -NO "Gres:GresUsed,NodeList" -n "$node" 2>/dev/null | tail -1)
         
         if [[ -z "$sinfo_line" ]]; then
-            log "  $node: sinfo returned empty"
+            log "  $node: sinfo returned empty, skipping"
             continue
         fi
         
@@ -476,31 +479,43 @@ migrate_to_node() {
         log "  $node: $total_gpus total, $used_gpus used, $free_gpus free"
         
         if [[ $free_gpus -ge $NUM_GPUS ]]; then
-            log "Found $node with $free_gpus free GPUs (need $NUM_GPUS)"
-            
-            # Notify BEFORE SSH so we see where we're going
-            notify "Migrating to $node" \
-                "$HOSTNAME_SHORT -> $node" 3
-            
-            ssh -o ConnectTimeout=30 "$node" "tmux new-session -d -s $SESSION_NAME '$SCRIPT_DIR/llm_watchdog.sh $SCRIPT_DIR/config.env $AVAILABLE_NODES'" 2>/dev/null
-            local ssh_status=$?
-            
-            if [[ $ssh_status -ne 0 ]]; then
-                log "SSH failed to $node, trying next node..."
-                continue
-            fi
-            
-            log "Migration complete to $node, exiting..."
-            sleep 1
-            exit 0
+            log "==> Found $node with $free_gpus free GPUs (need $NUM_GPUS)"
+            found_node="$node"
+            found_free="$free_gpus"
+            break
+        else
+            log "  $node: only $free_gpus free, need $NUM_GPUS"
         fi
     done
     
-    log "No nodes available with $NUM_GPUS free GPUs"
-    notify "No nodes available, permanently stopping" \
-        "$HOSTNAME_SHORT: No nodes with $NUM_GPUS GPUs" 4
-    pkill -u "$USER" 2>/dev/null || true
-    exit 1
+    if [[ -z "$found_node" ]]; then
+        log "=== No nodes available with $NUM_GPUS free GPUs ==="
+        notify "No nodes available, permanently stopping" \
+            "$HOSTNAME_SHORT: No nodes with $NUM_GPUS GPUs" 4
+        pkill -u "$USER" 2>/dev/null || true
+        exit 1
+    fi
+    
+    log "=== Starting new worker on $found_node ($found_free free GPUs) ==="
+    
+    # Notify BEFORE SSH so we see where we're going
+    notify "Migrating to $found_node" \
+        "$HOSTNAME_SHORT -> $found_node ($found_free free GPUs)" 3
+    
+    ssh -o ConnectTimeout=30 "$found_node" "tmux new-session -d -s $SESSION_NAME '$SCRIPT_DIR/llm_watchdog.sh $SCRIPT_DIR/config.env $AVAILABLE_NODES'" 2>/dev/null
+    local ssh_status=$?
+    
+    if [[ $ssh_status -ne 0 ]]; then
+        log "SSH failed to $found_node, permanently stopping"
+        notify "SSH failed to $found_node, permanently stopping" \
+            "$HOSTNAME_SHORT: SSH failed" 4
+        pkill -u "$USER" 2>/dev/null || true
+        exit 1
+    fi
+    
+    log "Migration complete to $found_node, exiting..."
+    sleep 1
+    exit 0
 }
 
 # =============================================================================
@@ -587,10 +602,12 @@ handle_new_job() {
         return 0
     fi
 
-    log "Job change detected. Checking GPU assignments via scontrol..."
+    log "=== Job change detected: checking GPU assignments (we have $ACTIVE_GPUS) ==="
 
     # Find all active jobs and check their GPU assignments
     local conflict=false
+    local conflict_job=""
+    local conflict_gpus=""
     while read -r jobid; do
         [[ -z "$jobid" ]] && continue
         local job_gpus
@@ -602,8 +619,10 @@ handle_new_job() {
         fi
 
         if check_overlap "$job_gpus"; then
-            log "  Job $jobid: GPUs $job_gpus -- CONFLICTS with ours ($ACTIVE_GPUS)"
+            log "  ==> CONFLICT: Job $jobid on GPUs $job_gpus (we have $ACTIVE_GPUS)"
             conflict=true
+            conflict_job="$jobid"
+            conflict_gpus="$job_gpus"
             break
         else
             log "  Job $jobid: GPUs $job_gpus -- no conflict"
@@ -611,6 +630,7 @@ handle_new_job() {
     done < <(list_job_ids)
 
     if $conflict; then
+        log "Migration required: job $conflict_job on our GPUs $conflict_gpus"
         return 0
     fi
 

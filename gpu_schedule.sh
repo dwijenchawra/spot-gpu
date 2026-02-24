@@ -9,6 +9,8 @@
 set -uo pipefail
 
 PARTITION="${1:-cocosys}"
+total_all=0
+used_all=0
 
 echo "=========================================="
 echo "GPU Schedule Analysis for $PARTITION"
@@ -38,7 +40,6 @@ squeue --states=pending -p "$PARTITION" --sort=-p -o "%.18i %.9P %.8j %.8u %.2t 
     echo "$jobid priority=$priority $user"
 done
 
-echo ""
 echo "=== GPU Utilization Summary ==="
 
 # Parse each node

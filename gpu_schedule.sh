@@ -24,15 +24,9 @@ squeue --states=running -p "$PARTITION" --sort=S -o "%.18i %.9P %.8j %.8u %.2t %
     [[ -z "$jobid" ]] && continue
     [[ "$jobid" == "JOBID" ]] && continue
     
-    # Get detailed GPU info
-    gpu_info=$(scontrol show job "$jobid" 2>/dev/null | grep -oP 'GRES=gpu:[^(]*\([^)]+\)' || echo "")
-    if [[ -z "$gpu_info" ]]; then
-        gpu_info="no GPUs"
-    fi
-    
     end_time=$(scontrol show job "$jobid" 2>/dev/null | grep -oP 'EndTime=\K[^ ]+' || echo "N/A")
     
-    echo "$jobid $user $time -> $end_time | $gpu_info"
+    echo "$jobid $user $time -> $end_time"
 done
 
 echo ""
@@ -46,47 +40,52 @@ done
 
 echo ""
 echo "=== GPU Utilization Summary ==="
-total=0
-used=0
 
-for node in $(sinfo -p "$PARTITION" -N 2>/dev/null | awk 'NR>1 {print $1}' | sort -u); do
+# Parse each node
+for line in $(sinfo -NO "NodeList:15,Gres:20,GresUsed:30" -p "$PARTITION" 2>/dev/null | tail -n +2); do
+    node=$(echo "$line" | awk '{print $1}')
     [[ -z "$node" ]] && continue
     
-    sinfo_line=$(sinfo -NO "Gres:20,GresUsed:30" -n "$node" 2>/dev/null | tail -1)
-    [[ -z "$sinfo_line" ]] && continue
-    
-    gres_used=$(echo "$sinfo_line" | grep -oP 'GRES_USED=\Kgpu:[^ ]+' || true)
-    
-    # Total GPUs
-    if [[ "$sinfo_line" =~ gpu:h200:([0-9]+) ]]; then
-        node_total=${BASH_REMATCH[1]}
-        total=$(( total + node_total ))
-    elif [[ "$sinfo_line" =~ gpu:([0-9]+) ]]; then
-        node_total=${BASH_REMATCH[1]}
-        total=$(( total + node_total ))
+    # Parse total GPUs from GRES column
+    if echo "$line" | grep -q "gpu:h200:"; then
+        total=$(echo "$line" | grep -oP 'gpu:h200:\K[0-9]+')
+    elif echo "$line" | grep -q "gpu:"; then
+        total=$(echo "$line" | grep -oP 'gpu:\K[0-9]+')
+    else
+        continue
     fi
     
-    # Used GPUs
-    if [[ -n "$gres_used" ]]; then
-        if [[ "$gres_used" =~ IDX:([0-9,\-]+) ]]; then
-            idx="${BASH_REMATCH[1]}"
-            count=$(echo "$idx" | tr ',' '\n' | while read -r r; do
-                if [[ "$r" == *-* ]]; then
-                    seq "${r%-*}" "${r#*-}" 2>/dev/null | wc -l
-                else
-                    echo 1
-                fi
-            done | paste -sd+ | bc)
-            used=$(( used + ${count:-0} ))
-        elif [[ "$gres_used" =~ gpu:h200:([0-9]+) ]]; then
-            used=$(( used + ${BASH_REMATCH[1]} ))
-        fi
+    # Parse used GPUs from GRES_USED column
+    gres_used=$(echo "$line" | grep -oP 'GRES_USED=\Kgpu:[^ ]+' || echo "")
+    
+    used=0
+    if echo "$gres_used" | grep -q "IDX:"; then
+        # Has specific indices like IDX:0-5 or IDX:0,2,4
+        idx=$(echo "$gres_used" | grep -oP 'IDX:\K[0-9,\-]+')
+        used=$(echo "$idx" | tr ',' '\n' | while read -r r; do
+            if [[ "$r" == *-* ]]; then
+                seq "${r%-*}" "${r#*-}" 2>/dev/null | wc -l
+            else
+                echo 1
+            fi
+        done | paste -sd+ | bc)
+    elif echo "$gres_used" | grep -q "gpu:h200:"; then
+        used=$(echo "$gres_used" | grep -oP 'gpu:h200:\K[0-9]+')
     fi
+    
+    used=${used:-0}
+    free=$(( total - used ))
+    
+    echo "$node: ${total}gpus total, ${used} used, ${free} free"
+    
+    total_all=$(( ${total_all:-0} + total ))
+    used_all=$(( used_all + used ))
 done
 
-echo "Total GPUs: ${total:-0}"
-echo "Used GPUs: ${used:-0}"
-echo "Free GPUs: $(( ${total:-0} - ${used:-0} ))"
+echo ""
+echo "Total GPUs: ${total_all:-0}"
+echo "Used GPUs: ${used_all:-0}"
+echo "Free GPUs: $(( ${total_all:-0} - ${used_all:-0} ))"
 
 echo ""
 echo "=== Next Jobs to Complete ==="

@@ -377,9 +377,10 @@ stop_server() {
         wait "$SERVER_PID" 2>/dev/null
         sleep 1
 
-        # Nuclear option: if Slurm jobs are waiting for our GPUs, kill everything
+        # Nuclear option: kill vLLM and cloudflared, but let Slurm handle its own jobs
         if [[ $(count_jobs) -gt 0 ]]; then
-            pkill -u "$USER" 2>/dev/null || true
+            pkill -f "vllm serve" 2>/dev/null || true
+            pkill -f "cloudflared" 2>/dev/null || true
         fi
     fi
     SERVER_PID=""
@@ -423,16 +424,19 @@ migrate_to_node() {
     log "Migration triggered: conflict on GPUs $ACTIVE_GPUS, killing vLLM..."
     
     stop_server
+    stop_tunnel
     
-    log "Killing all user processes on current node..."
-    pkill -u "$USER" 2>/dev/null || true
-    sleep 2
+    log "Cleaning up watchdog processes..."
+    pkill -f "llm_watchdog.sh" 2>/dev/null || true
+    pkill -f "cloudflared" 2>/dev/null || true
+    sleep 1
+    
+    # NOTE: Do NOT pkill -u $USER - this kills Slurm jobs and causes node reboot
     
     if [[ -z "$AVAILABLE_NODES" ]]; then
         log "No available nodes configured"
         notify "No nodes available, permanently stopping" \
             "$HOSTNAME_SHORT: No nodes in AVAILABLE_NODES" 4
-        pkill -u "$USER" 2>/dev/null || true
         exit 1
     fi
     
@@ -492,7 +496,6 @@ migrate_to_node() {
         log "=== No nodes available with $NUM_GPUS free GPUs ==="
         notify "No nodes available, permanently stopping" \
             "$HOSTNAME_SHORT: No nodes with $NUM_GPUS GPUs" 4
-        pkill -u "$USER" 2>/dev/null || true
         exit 1
     fi
     
@@ -509,7 +512,6 @@ migrate_to_node() {
         log "SSH failed to $found_node, permanently stopping"
         notify "SSH failed to $found_node, permanently stopping" \
             "$HOSTNAME_SHORT: SSH failed" 4
-        pkill -u "$USER" 2>/dev/null || true
         exit 1
     fi
     

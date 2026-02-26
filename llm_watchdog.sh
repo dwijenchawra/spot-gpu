@@ -103,8 +103,11 @@ DOWNTIME_START=0
 # Logging
 # =============================================================================
 
+LOG_FILE="$SCRIPT_DIR/runlogs.txt"
+
 log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] $1" | tee -a "$LOG_FILE"
 }
 
 # =============================================================================

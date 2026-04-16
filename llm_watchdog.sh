@@ -56,12 +56,29 @@ for arg in "$@"; do
 done
 
 # =============================================================================
-# Environment Resolution (per-node CUDA setup from config.env)
+# Environment Resolution (config.env + model profile)
 # =============================================================================
+#
+# Model profile may override infrastructure via:
+#   VENV_PROFILE   = path to venv (relative to SCRIPT_DIR or absolute)
+#   REQUIRES_CUDA13 = "true" forces CUDA override paths on regardless of node
+
+if [[ "${REQUIRES_CUDA13:-false}" == "true" ]]; then
+    CUDA_SETUP="true"
+fi
 
 if [[ "${CUDA_SETUP:-false}" == "true" ]]; then
     export LD_LIBRARY_PATH="${CUDA12_LIB}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     export CUDA_HOME="${CUDA_HOME_OVERRIDE}"
+fi
+
+if [[ -n "${VENV_PROFILE:-}" ]]; then
+    if [[ "$VENV_PROFILE" == /* ]]; then
+        LLM_VENV="$VENV_PROFILE"
+    else
+        LLM_VENV="$SCRIPT_DIR/$VENV_PROFILE"
+    fi
+    LLM_BIN="${LLM_VENV}/bin/vllm"
 fi
 
 export HF_HOME="${HF_HOME}"
